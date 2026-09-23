@@ -3,44 +3,50 @@ import pandas as pd
 import yfinance as yf
 
 st.set_page_config(
-    page_title="XAU/USD Trading Signals",
-    page_icon="🟡",
-    layout="centered"
+    page_title="XAU/USD Signal Engine",
+    page_icon="🟡"
 )
 
-st.title("🟡 XAU/USD Trading Signals")
-st.caption("15 Minute • EMA 20/50 • RSI • MACD")
+st.title("🟡 XAU/USD Signal Engine")
+st.caption("15M • EMA • RSI • MACD • ATR")
 
 @st.cache_data(ttl=60)
 def get_data():
-    data = yf.download(
+    df = yf.download(
         "GC=F",
-        period="5d",
+        period="10d",
         interval="15m",
         auto_adjust=False,
         progress=False
     )
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    return data.dropna()
+    return df.dropna()
 
 
-data = get_data()
+df = get_data()
 
-if data.empty:
-    st.error("❌ لم يتم الحصول على بيانات الذهب.")
+if df.empty:
+    st.error("No gold data available.")
     st.stop()
 
+close = df["Close"]
+high = df["High"]
+low = df["Low"]
 
-close = data["Close"]
-
+# =========================
 # EMA
-data["EMA20"] = close.ewm(span=20, adjust=False).mean()
-data["EMA50"] = close.ewm(span=50, adjust=False).mean()
+# =========================
 
+df["EMA20"] = close.ewm(span=20, adjust=False).mean()
+df["EMA50"] = close.ewm(span=50, adjust=False).mean()
+
+# =========================
 # RSI
+# =========================
+
 delta = close.diff()
 
 gain = delta.clip(lower=0)
@@ -50,20 +56,44 @@ avg_gain = gain.rolling(14).mean()
 avg_loss = loss.rolling(14).mean()
 
 rs = avg_gain / avg_loss
-data["RSI"] = 100 - (100 / (1 + rs))
 
+df["RSI"] = 100 - (100 / (1 + rs))
+
+# =========================
 # MACD
+# =========================
+
 ema12 = close.ewm(span=12, adjust=False).mean()
 ema26 = close.ewm(span=26, adjust=False).mean()
 
-data["MACD"] = ema12 - ema26
-data["MACD_SIGNAL"] = data["MACD"].ewm(
+df["MACD"] = ema12 - ema26
+df["MACD_SIGNAL"] = df["MACD"].ewm(
     span=9,
     adjust=False
 ).mean()
 
-# آخر شمعة
-last = data.iloc[-1]
+# =========================
+# ATR
+# =========================
+
+previous_close = close.shift(1)
+
+tr1 = high - low
+tr2 = (high - previous_close).abs()
+tr3 = (low - previous_close).abs()
+
+true_range = pd.concat(
+    [tr1, tr2, tr3],
+    axis=1
+).max(axis=1)
+
+df["ATR"] = true_range.rolling(14).mean()
+
+# =========================
+# LAST CANDLE
+# =========================
+
+last = df.iloc[-1]
 
 price = float(last["Close"])
 ema20 = float(last["EMA20"])
@@ -71,107 +101,114 @@ ema50 = float(last["EMA50"])
 rsi = float(last["RSI"])
 macd = float(last["MACD"])
 macd_signal = float(last["MACD_SIGNAL"])
-
+atr = float(last["ATR"])
 
 # =========================
 # SIGNAL ENGINE
 # =========================
 
-score = 0
-reasons = []
+buy_score = 0
+sell_score = 0
 
-# EMA
+buy_reasons = []
+sell_reasons = []
+
+# EMA trend
 if ema20 > ema50:
-    score += 1
-    reasons.append("EMA Bullish")
-elif ema20 < ema50:
-    score -= 1
-    reasons.append("EMA Bearish")
+    buy_score += 1
+    buy_reasons.append("EMA20 > EMA50")
 
-# RSI
-if 50 < rsi < 70:
-    score += 1
-    reasons.append("RSI Bullish")
-elif 30 < rsi < 50:
-    score -= 1
-    reasons.append("RSI Bearish")
+elif ema20 < ema50:
+    sell_score += 1
+    sell_reasons.append("EMA20 < EMA50")
 
 # MACD
 if macd > macd_signal:
-    score += 1
-    reasons.append("MACD Bullish")
+    buy_score += 1
+    buy_reasons.append("MACD bullish")
+
 elif macd < macd_signal:
-    score -= 1
-    reasons.append("MACD Bearish")
+    sell_score += 1
+    sell_reasons.append("MACD bearish")
 
+# RSI
+if 50 <= rsi <= 70:
+    buy_score += 1
+    buy_reasons.append("RSI bullish zone")
+
+elif 30 <= rsi < 50:
+    sell_score += 1
+    sell_reasons.append("RSI bearish zone")
 
 # =========================
-# AVOID LATE ENTRIES
+# EXTREME RSI FILTER
 # =========================
 
-# تشبع بيعي قوي
 if rsi < 20:
-    score = min(score, 0)
-    reasons.append("RSI Oversold - Avoid Late SELL")
+    sell_score = 0
+    sell_reasons = []
+    sell_blocked = True
 
-# تشبع شرائي قوي
-if rsi > 80:
-    score = max(score, 0)
-    reasons.append("RSI Overbought - Avoid Late BUY")
+elif rsi > 80:
+    buy_score = 0
+    buy_reasons = []
+    buy_blocked = True
 
+else:
+    sell_blocked = False
+    buy_blocked = False
 
 # =========================
-# SIGNAL
+# FINAL SIGNAL
 # =========================
 
-if score >= 2:
+if buy_score >= 2 and not buy_blocked:
     signal = "🟢 BUY"
     direction = "BUY"
+    strength = (buy_score / 3) * 100
+    reasons = buy_reasons
 
-elif score <= -2:
+elif sell_score >= 2 and not sell_blocked:
     signal = "🔴 SELL"
     direction = "SELL"
+    strength = (sell_score / 3) * 100
+    reasons = sell_reasons
 
 else:
     signal = "⚪ WAIT"
     direction = "WAIT"
-
-
-# =========================
-# STRENGTH
-# =========================
-
-strength = min(abs(score) / 3 * 100, 100)
+    strength = 0
+    reasons = ["No clean confirmation"]
 
 # =========================
-# RISK MANAGEMENT
+# ENTRY / SL / TP
 # =========================
-
-risk_distance = price * 0.0025
 
 if direction == "BUY":
 
     entry = price
-    stop_loss = price - risk_distance
+    sl = price - (atr * 1.5)
 
-    tp1 = price + risk_distance * 1.5
-    tp2 = price + risk_distance * 2.5
+    tp1 = price + (atr * 1.5)
+    tp2 = price + (atr * 2.5)
+    tp3 = price + (atr * 3.5)
 
 elif direction == "SELL":
 
     entry = price
-    stop_loss = price + risk_distance
+    sl = price + (atr * 1.5)
 
-    tp1 = price - risk_distance * 1.5
-    tp2 = price - risk_distance * 2.5
+    tp1 = price - (atr * 1.5)
+    tp2 = price - (atr * 2.5)
+    tp3 = price - (atr * 3.5)
 
 else:
 
     entry = price
-    stop_loss = None
+    sl = None
     tp1 = None
     tp2 = None
-
+    tp3 = None
 
 # =========================
 # DISPLAY
@@ -184,79 +221,39 @@ st.metric(
     f"{strength:.0f}%"
 )
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
+    st.metric("Gold", f"{price:.2f}")
+    st.metric("EMA20", f"{ema20:.2f}")
+    st.metric("EMA50", f"{ema50:.2f}")
 
-    st.metric(
-        "Gold Price",
-        f"{price:.2f}"
-    )
-
-    st.metric(
-        "EMA 20",
-        f"{ema20:.2f}"
-    )
-
-    st.metric(
-        "EMA 50",
-        f"{ema50:.2f}"
-    )
-
-with col2:
-
-    st.metric(
-        "RSI",
-        f"{rsi:.2f}"
-    )
-
-    st.metric(
-        "MACD",
-        f"{macd:.2f}"
-    )
-
-    st.metric(
-        "MACD Signal",
-        f"{macd_signal:.2f}"
-    )
-
+with c2:
+    st.metric("RSI", f"{rsi:.2f}")
+    st.metric("MACD", f"{macd:.2f}")
+    st.metric("ATR", f"{atr:.2f}")
 
 # =========================
-# TRADE LEVELS
+# TRADE PLAN
 # =========================
 
 if direction != "WAIT":
 
     st.divider()
 
-    st.subheader("🎯 Trade Levels")
+    st.subheader("🎯 Trade Plan")
 
-    col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
 
-    with col1:
+    with c1:
+        st.metric("Entry", f"{entry:.2f}")
+        st.metric("Stop Loss", f"{sl:.2f}")
 
-        st.metric(
-            "Entry",
-            f"{entry:.2f}"
-        )
+    with c2:
+        st.metric("TP1", f"{tp1:.2f}")
+        st.metric("TP2", f"{tp2:.2f}")
 
-        st.metric(
-            "Stop Loss",
-            f"{stop_loss:.2f}"
-        )
-
-    with col2:
-
-        st.metric(
-            "TP1",
-            f"{tp1:.2f}"
-        )
-
-        st.metric(
-            "TP2",
-            f"{tp2:.2f}"
-        )
-
+    st.metric("TP3", f"{tp3:.2f}")
 
 # =========================
 # ANALYSIS
@@ -264,41 +261,40 @@ if direction != "WAIT":
 
 st.divider()
 
-st.subheader("🔎 Analysis")
+st.subheader("🔎 Confirmation")
 
 for reason in reasons:
     st.write("•", reason)
 
-
 # =========================
-# DATA
+# LAST DATA
 # =========================
 
 st.divider()
 
-st.subheader("📊 Last 20 Candles")
+st.subheader("📊 Market Data")
 
 st.dataframe(
-    data[
+    df[
         [
             "Close",
             "EMA20",
             "EMA50",
             "RSI",
             "MACD",
-            "MACD_SIGNAL"
+            "MACD_SIGNAL",
+            "ATR"
         ]
     ].tail(20),
     use_container_width=True
 )
-
 
 if st.button("🔄 Refresh"):
 
     st.cache_data.clear()
     st.rerun()
 
-
 st.caption(
-    "⚠️ أداة تحليلية تعليمية. الإشارات ليست ضماناً للربح ولا تنفذ الصفقات تلقائياً."
+    "⚠️ Educational technical-analysis tool. "
+    "Signals do not guarantee profits and no trades are executed automatically."
 )
