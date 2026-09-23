@@ -1,300 +1,393 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+from datetime import datetime
 
 st.set_page_config(
-    page_title="XAU/USD Signal Engine",
-    page_icon="🟡"
+    page_title="XAU/USD Trading Signals",
+    page_icon="🟡",
+    layout="centered"
 )
 
-st.title("🟡 XAU/USD Signal Engine")
-st.caption("15M • EMA • RSI • MACD • ATR")
+st.title("🟡 XAU/USD Trading Signals")
+st.caption("15 Minute • EMA 20/50 • RSI • MACD • ATR")
+st.caption("🔄 Auto refresh: every 60 seconds")
 
+
+# =========================
+# GET XAU/USD SPOT DATA
+# =========================
 @st.cache_data(ttl=60)
 def get_data():
-    df = yf.download(
-        "GC=F",
+
+    ticker = yf.Ticker("XAUUSD=X")
+
+    df = ticker.history(
         period="10d",
         interval="15m",
-        auto_adjust=False,
-        progress=False
+        auto_adjust=False
     )
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if df.empty:
+        return pd.DataFrame()
 
-    return df.dropna()
+    df = df.dropna()
 
+    return df
 
-df = get_data()
-
-if df.empty:
-    st.error("No gold data available.")
-    st.stop()
-
-close = df["Close"]
-high = df["High"]
-low = df["Low"]
 
 # =========================
-# EMA
+# INDICATORS
 # =========================
+def calculate_indicators(df):
 
-df["EMA20"] = close.ewm(span=20, adjust=False).mean()
-df["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    df = df.copy()
 
-# =========================
-# RSI
-# =========================
+    # EMA
+    df["EMA20"] = df["Close"].ewm(
+        span=20,
+        adjust=False
+    ).mean()
 
-delta = close.diff()
+    df["EMA50"] = df["Close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
-gain = delta.clip(lower=0)
-loss = -delta.clip(upper=0)
+    # RSI
+    delta = df["Close"].diff()
 
-avg_gain = gain.rolling(14).mean()
-avg_loss = loss.rolling(14).mean()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-rs = avg_gain / avg_loss
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
 
-df["RSI"] = 100 - (100 / (1 + rs))
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
 
-# =========================
-# MACD
-# =========================
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-ema12 = close.ewm(span=12, adjust=False).mean()
-ema26 = close.ewm(span=26, adjust=False).mean()
+    # MACD
+    ema12 = df["Close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
 
-df["MACD"] = ema12 - ema26
-df["MACD_SIGNAL"] = df["MACD"].ewm(
-    span=9,
-    adjust=False
-).mean()
+    ema26 = df["Close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
 
-# =========================
-# ATR
-# =========================
+    df["MACD"] = ema12 - ema26
 
-previous_close = close.shift(1)
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
-tr1 = high - low
-tr2 = (high - previous_close).abs()
-tr3 = (low - previous_close).abs()
+    # ATR
+    high_low = df["High"] - df["Low"]
 
-true_range = pd.concat(
-    [tr1, tr2, tr3],
-    axis=1
-).max(axis=1)
+    high_close = (
+        df["High"] - df["Close"].shift()
+    ).abs()
 
-df["ATR"] = true_range.rolling(14).mean()
+    low_close = (
+        df["Low"] - df["Close"].shift()
+    ).abs()
 
-# =========================
-# LAST CANDLE
-# =========================
+    true_range = pd.concat(
+        [
+            high_low,
+            high_close,
+            low_close
+        ],
+        axis=1
+    ).max(axis=1)
 
-last = df.iloc[-1]
+    df["ATR"] = true_range.rolling(14).mean()
 
-price = float(last["Close"])
-ema20 = float(last["EMA20"])
-ema50 = float(last["EMA50"])
-rsi = float(last["RSI"])
-macd = float(last["MACD"])
-macd_signal = float(last["MACD_SIGNAL"])
-atr = float(last["ATR"])
+    return df
+
 
 # =========================
 # SIGNAL ENGINE
 # =========================
+def generate_signal(df):
 
-buy_score = 0
-sell_score = 0
+    last = df.iloc[-1]
 
-buy_reasons = []
-sell_reasons = []
+    price = float(last["Close"])
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    rsi = float(last["RSI"])
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_SIGNAL"])
+    atr = float(last["ATR"])
 
-# EMA trend
-if ema20 > ema50:
-    buy_score += 1
-    buy_reasons.append("EMA20 > EMA50")
-
-elif ema20 < ema50:
-    sell_score += 1
-    sell_reasons.append("EMA20 < EMA50")
-
-# MACD
-if macd > macd_signal:
-    buy_score += 1
-    buy_reasons.append("MACD bullish")
-
-elif macd < macd_signal:
-    sell_score += 1
-    sell_reasons.append("MACD bearish")
-
-# RSI
-if 50 <= rsi <= 70:
-    buy_score += 1
-    buy_reasons.append("RSI bullish zone")
-
-elif 30 <= rsi < 50:
-    sell_score += 1
-    sell_reasons.append("RSI bearish zone")
-
-# =========================
-# EXTREME RSI FILTER
-# =========================
-
-if rsi < 20:
-    sell_score = 0
-    sell_reasons = []
-    sell_blocked = True
-
-elif rsi > 80:
     buy_score = 0
-    buy_reasons = []
-    buy_blocked = True
+    sell_score = 0
 
-else:
-    sell_blocked = False
-    buy_blocked = False
+    # EMA
+    if ema20 > ema50:
+        buy_score += 1
+    elif ema20 < ema50:
+        sell_score += 1
 
-# =========================
-# FINAL SIGNAL
-# =========================
+    # MACD
+    if macd > macd_signal:
+        buy_score += 1
+    elif macd < macd_signal:
+        sell_score += 1
 
-if buy_score >= 2 and not buy_blocked:
-    signal = "🟢 BUY"
-    direction = "BUY"
-    strength = (buy_score / 3) * 100
-    reasons = buy_reasons
+    # RSI
+    if 50 < rsi < 80:
+        buy_score += 1
+    elif 20 < rsi < 50:
+        sell_score += 1
 
-elif sell_score >= 2 and not sell_blocked:
-    signal = "🔴 SELL"
-    direction = "SELL"
-    strength = (sell_score / 3) * 100
-    reasons = sell_reasons
+    # Price vs EMA20
+    if price > ema20:
+        buy_score += 1
+    elif price < ema20:
+        sell_score += 1
 
-else:
-    signal = "⚪ WAIT"
-    direction = "WAIT"
-    strength = 0
-    reasons = ["No clean confirmation"]
+    # Extreme RSI protection
+    if rsi < 20:
+        signal = "WAIT"
+        strength = 0
 
-# =========================
-# ENTRY / SL / TP
-# =========================
+    elif rsi > 80:
+        signal = "WAIT"
+        strength = 0
 
-if direction == "BUY":
+    elif buy_score >= 3 and buy_score > sell_score:
+        signal = "BUY"
+        strength = int((buy_score / 4) * 100)
+
+    elif sell_score >= 3 and sell_score > buy_score:
+        signal = "SELL"
+        strength = int((sell_score / 4) * 100)
+
+    else:
+        signal = "WAIT"
+        strength = int(
+            max(buy_score, sell_score) / 4 * 100
+        )
+
+    # =========================
+    # ENTRY / SL / TP
+    # =========================
 
     entry = price
-    sl = price - (atr * 1.5)
 
-    tp1 = price + (atr * 1.5)
-    tp2 = price + (atr * 2.5)
-    tp3 = price + (atr * 3.5)
+    if pd.isna(atr) or atr <= 0:
+        atr = price * 0.001
 
-elif direction == "SELL":
+    if signal == "BUY":
 
-    entry = price
-    sl = price + (atr * 1.5)
+        sl = entry - (atr * 1.5)
 
-    tp1 = price - (atr * 1.5)
-    tp2 = price - (atr * 2.5)
-    tp3 = price - (atr * 3.5)
+        tp1 = entry + (atr * 1.0)
+        tp2 = entry + (atr * 2.0)
+        tp3 = entry + (atr * 3.0)
 
-else:
+    elif signal == "SELL":
 
-    entry = price
-    sl = None
-    tp1 = None
-    tp2 = None
-    tp3 = None
+        sl = entry + (atr * 1.5)
+
+        tp1 = entry - (atr * 1.0)
+        tp2 = entry - (atr * 2.0)
+        tp3 = entry - (atr * 3.0)
+
+    else:
+
+        sl = None
+        tp1 = None
+        tp2 = None
+        tp3 = None
+
+    return {
+        "signal": signal,
+        "strength": strength,
+        "price": price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "atr": atr,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3
+    }
+
 
 # =========================
-# DISPLAY
+# LIVE DASHBOARD
 # =========================
+@st.fragment(run_every="60s")
+def live_dashboard():
 
-st.subheader(signal)
+    df = get_data()
 
-st.metric(
-    "Signal Strength",
-    f"{strength:.0f}%"
-)
+    if df.empty:
 
-c1, c2 = st.columns(2)
+        st.error(
+            "❌ ما قدرناش نجيبو بيانات XAU/USD حاليا."
+        )
 
-with c1:
-    st.metric("Gold", f"{price:.2f}")
-    st.metric("EMA20", f"{ema20:.2f}")
-    st.metric("EMA50", f"{ema50:.2f}")
+        return
 
-with c2:
-    st.metric("RSI", f"{rsi:.2f}")
-    st.metric("MACD", f"{macd:.2f}")
-    st.metric("ATR", f"{atr:.2f}")
+    df = calculate_indicators(df)
 
-# =========================
-# TRADE PLAN
-# =========================
+    df = df.dropna()
 
-if direction != "WAIT":
+    if len(df) < 60:
 
-    st.divider()
+        st.warning(
+            "⏳ مازال نحتاجو بيانات أكثر لحساب المؤشرات."
+        )
 
-    st.subheader("🎯 Trade Plan")
+        return
+
+    result = generate_signal(df)
+
+    signal = result["signal"]
+
+    # =========================
+    # SIGNAL
+    # =========================
+
+    if signal == "BUY":
+        st.success(
+            f"🟢 BUY — Strength {result['strength']}%"
+        )
+
+    elif signal == "SELL":
+        st.error(
+            f"🔴 SELL — Strength {result['strength']}%"
+        )
+
+    else:
+        st.warning(
+            f"⚪ WAIT — Strength {result['strength']}%"
+        )
+
+    # =========================
+    # PRICE
+    # =========================
+
+    st.metric(
+        "XAU/USD Spot",
+        f"${result['price']:.2f}"
+    )
+
+    # =========================
+    # TRADE LEVELS
+    # =========================
+
+    st.subheader("📍 Trade Levels")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.metric(
+            "Entry",
+            f"{result['entry']:.2f}"
+        )
+
+        if result["sl"] is not None:
+
+            st.metric(
+                "Stop Loss",
+                f"{result['sl']:.2f}"
+            )
+
+    with col2:
+
+        if result["tp1"] is not None:
+
+            st.metric(
+                "TP1",
+                f"{result['tp1']:.2f}"
+            )
+
+            st.metric(
+                "TP2",
+                f"{result['tp2']:.2f}"
+            )
+
+            st.metric(
+                "TP3",
+                f"{result['tp3']:.2f}"
+            )
+
+    # =========================
+    # INDICATORS
+    # =========================
+
+    st.subheader("📊 Indicators")
 
     c1, c2 = st.columns(2)
 
     with c1:
-        st.metric("Entry", f"{entry:.2f}")
-        st.metric("Stop Loss", f"{sl:.2f}")
+
+        st.write(
+            f"**EMA 20:** {result['ema20']:.2f}"
+        )
+
+        st.write(
+            f"**EMA 50:** {result['ema50']:.2f}"
+        )
+
+        st.write(
+            f"**RSI:** {result['rsi']:.2f}"
+        )
 
     with c2:
-        st.metric("TP1", f"{tp1:.2f}")
-        st.metric("TP2", f"{tp2:.2f}")
 
-    st.metric("TP3", f"{tp3:.2f}")
+        st.write(
+            f"**MACD:** {result['macd']:.4f}"
+        )
 
-# =========================
-# ANALYSIS
-# =========================
+        st.write(
+            f"**MACD Signal:** {result['macd_signal']:.4f}"
+        )
 
-st.divider()
+        st.write(
+            f"**ATR:** {result['atr']:.2f}"
+        )
 
-st.subheader("🔎 Confirmation")
+    # =========================
+    # CHART
+    # =========================
 
-for reason in reasons:
-    st.write("•", reason)
+    st.subheader("📈 XAU/USD — 15m")
 
-# =========================
-# LAST DATA
-# =========================
+    chart_data = df[[
+        "Close",
+        "EMA20",
+        "EMA50"
+    ]].tail(100)
 
-st.divider()
+    st.line_chart(chart_data)
 
-st.subheader("📊 Market Data")
+    # =========================
+    # UPDATE TIME
+    # =========================
 
-st.dataframe(
-    df[
-        [
-            "Close",
-            "EMA20",
-            "EMA50",
-            "RSI",
-            "MACD",
-            "MACD_SIGNAL",
-            "ATR"
-        ]
-    ].tail(20),
-    use_container_width=True
-)
+    st.caption(
+        "Last update: "
+        + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
 
-if st.button("🔄 Refresh"):
+    st.caption(
+        "⚠️ الإشارة تقنية فقط وليست ضمانًا للربح."
+    )
 
-    st.cache_data.clear()
-    st.rerun()
 
-st.caption(
-    "⚠️ Educational technical-analysis tool. "
-    "Signals do not guarantee profits and no trades are executed automatically."
-)
+live_dashboard()
